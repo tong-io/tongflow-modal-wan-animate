@@ -1,0 +1,8 @@
+{
+    "include": ["deploy.py"],
+    "extraPaths": ["../../sdk"],
+    "reportMissingImports": "none",
+    "reportOptionalMemberAccess": "none",
+    "reportOptionalCall": "none",
+    "pythonVersion": "3.12"
+}
