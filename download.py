@@ -36,14 +36,13 @@ model_downloader = modal.App("model_downloader")
     ),
     volumes={"/models": volume},
     timeout=7200,
-    secrets=[modal.Secret.from_name("huggingface")],
+    secrets=[modal.Secret.from_dict({"HF_TOKEN": os.environ.get("HF_TOKEN", "")})],
 )
 def _download() -> None:
     from huggingface_hub import snapshot_download
 
     # Wan2.2-Animate-14B is a public repo; token is optional but harmless.
-    token = os.environ.get("HF_TOKEN")
-
+    token = os.environ.get("HF_TOKEN") or None
     # Always run snapshot_download — it is resumable and only fetches files that
     # are missing or changed, so it completes a previous partial download (the
     # earlier marker check wrongly skipped this when only config.json existed).

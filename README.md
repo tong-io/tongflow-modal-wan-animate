@@ -15,13 +15,8 @@ Add in TongFlow **Settings** (gear icon, top-right):
 | --- | --- | --- |
 | `MODAL_TOKEN_ID` | ✅ | Create at [modal.com/settings/tokens](https://modal.com/settings/tokens). |
 | `MODAL_TOKEN_SECRET` | ✅ | Paired with `MODAL_TOKEN_ID`. |
+| `HF_TOKEN` | ✅ | Required to fetch `Wan-AI/Wan2.2-Animate-14B` from Hugging Face. |
 
 ### Weights (Hugging Face)
 
-The plugin pulls `Wan-AI/Wan2.2-Animate-14B` from Hugging Face at deploy time and requires a token. Create the Modal secret it reads:
-
-```bash
-modal secret create huggingface HF_TOKEN=hf_xxx
-```
-
-Without `HF_TOKEN` the weight download fails.
+The plugin injects `HF_TOKEN` from your TongFlow Settings into the Modal download job at deploy time — no manual `modal secret create` needed. Without it the weight download fails.
