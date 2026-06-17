@@ -1,6 +1,6 @@
 # tongflow-modal-wan-animate
 
-Official TongFlow plugin. Character swap and motion transfer with **Wan-Animate** (`Wan-AI/Wan2.2-Animate-14B`), running on a GPU via [Modal](https://modal.com). Takes a driving video plus a reference and produces Animate Mix / Animate Move-style output.
+Official [TongFlow](https://github.com/tong-io/tongflow) plugin. Character swap and motion transfer with **Wan-Animate** (`Wan-AI/Wan2.2-Animate-14B`), running on a GPU via [Modal](https://modal.com). Takes a driving video plus a reference and produces Animate Mix / Animate Move-style output.
 
 ## Capabilities
 
