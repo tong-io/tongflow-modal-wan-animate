@@ -1,0 +1,26 @@
+{
+    "env": [
+        {
+            "key": "MODAL_TOKEN_ID",
+            "required": true,
+            "description": "Modal token id",
+            "url": "https://modal.com/settings/tokens"
+        },
+        {
+            "key": "MODAL_TOKEN_SECRET",
+            "required": true,
+            "description": "Modal token secret (paired with MODAL_TOKEN_ID)"
+        },
+        {
+            "key": "HF_TOKEN",
+            "description": "Required to fetch Wan-AI/Wan2.2-Animate-14B",
+            "url": "https://huggingface.co/settings/tokens",
+            "required": true
+        },
+        {
+            "key": "TONGFLOW_MODAL_CALL_TIMEOUT_S",
+            "default": "2400",
+            "description": "Max seconds to wait for a Modal call"
+        }
+    ]
+}
