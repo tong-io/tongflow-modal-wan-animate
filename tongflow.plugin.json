@@ -1,4 +1,9 @@
 {
+    "plugin": {
+        "name": "Wan-Animate",
+        "description": "Character swap and motion transfer with Wan2.2-Animate-14B (Animate Mix / Animate Move).",
+        "icon": "/plugins/tongflow-modal-wan-animate.svg"
+    },
     "env": [
         {
             "key": "MODAL_TOKEN_ID",
