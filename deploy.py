@@ -91,7 +91,7 @@ image = (
         f"pip install -r {COMFY}/requirements.txt",
         *_clone_cmds,
     )
-    .pip_install("tongflow==0.2.20", "fastapi[standard]")
+    .pip_install("tongflow==0.2.21", "fastapi[standard]")
     .env({"PYTHONPATH": COMFY, "HF_HOME": "/models/hf"})
 )
 
