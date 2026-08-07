@@ -292,7 +292,7 @@ def _submit_graph(base, wf):
 
 @deploy
 @app.cls(image=image, gpu="A100-80GB", volumes={"/models": volume},
-         timeout=1800, scaledown_window=5)
+         timeout=1800, scaledown_window=2)
 class Inference:
     @modal.enter()
     def _boot(self) -> None:
