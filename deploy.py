@@ -30,7 +30,38 @@ from tongflow.models.video_image_gen_video_move import (
 )
 from tongflow.node_slots import NodeSlots
 from tongflow.protocol import asset, prompt_media_to_bytes
-from tongflow.slots import node_slot
+from tongflow.slots import current_params, node_slot
+
+
+def _adv(name: str, default):
+    """Advanced-section override (``TONGFLOW_SLOT_PARAMS``) or the plugin default."""
+    v = current_params().get(name)
+    if v is None:
+        return default
+    if isinstance(default, bool):
+        return bool(v)
+    if isinstance(default, int):
+        return int(v)
+    if isinstance(default, float):
+        return float(v)
+    return v
+
+# Per-run knobs offered under the node's collapsed "Advanced" section.
+# Pure literal (the platform scanner reads it by AST, never imports this
+# module). Values reach the handlers via current_params(); an untouched
+# control is absent there and falls back to the plugin default.
+TONGFLOW_SLOT_PARAMS = {
+    "video-image-gen-video-move": {
+        "steps": {"type": "integer", "default": 6, "min": 2, "max": 12, "label": "Steps"},
+        "shift": {"type": "number", "default": 5.0, "min": 1.0, "max": 10.0, "step": 0.5, "label": "Shift"},
+        "relight_strength": {"type": "number", "default": 1.0, "min": 0.0, "max": 1.0, "step": 0.1, "label": "Relight LoRA strength", "description": "0 keeps the character's original lighting."},
+    },
+    "video-image-gen-video-mix": {
+        "steps": {"type": "integer", "default": 6, "min": 2, "max": 12, "label": "Steps"},
+        "shift": {"type": "number", "default": 5.0, "min": 1.0, "max": 10.0, "step": 0.5, "label": "Shift"},
+        "relight_strength": {"type": "number", "default": 1.0, "min": 0.0, "max": 1.0, "step": 0.1, "label": "Relight LoRA strength", "description": "0 keeps the character's original lighting."},
+    },
+}
 
 # Slots this plugin is the default implementation of: the node picker lists
 # it first and a newly added node preselects it. Read statically by the
@@ -91,7 +122,7 @@ image = (
         f"pip install -r {COMFY}/requirements.txt",
         *_clone_cmds,
     )
-    .pip_install("tongflow==0.2.21", "fastapi[standard]")
+    .pip_install("tongflow==0.3.3", "fastapi[standard]")
     .env({"PYTHONPATH": COMFY, "HF_HOME": "/models/hf"})
 )
 
@@ -167,7 +198,7 @@ def _build_workflow(img_name, vid_name, prompt, width, height, frame_cap, seed):
         "vae": {"class_type": "WanVideoVAELoader", "inputs": {
             "model_name": VAE, "precision": "bf16"}},
         "lora": {"class_type": "WanVideoLoraSelectMulti", "inputs": {
-            "lora_0": LORA_RELIGHT, "strength_0": 1.0,
+            "lora_0": LORA_RELIGHT, "strength_0": _adv("relight_strength", 1.0),
             "lora_1": LORA_LIGHTX2V, "strength_1": 1.0,
             "lora_2": "none", "strength_2": 1.0, "lora_3": "none", "strength_3": 1.0,
             "lora_4": "none", "strength_4": 1.0, "merge_loras": False}},
@@ -187,8 +218,8 @@ def _build_workflow(img_name, vid_name, prompt, width, height, frame_cap, seed):
             "clip_embeds": ["clip_enc", 0], "ref_images": ["load_img", 0],
             "pose_images": ["dwpose", 0]}},
         "sampler": {"class_type": "WanVideoSampler", "inputs": {
-            "model": ["model", 0], "image_embeds": ["embeds", 0], "steps": 6,
-            "cfg": 1.0, "shift": 5.0, "seed": seed, "force_offload": True,
+            "model": ["model", 0], "image_embeds": ["embeds", 0], "steps": _adv("steps", 6),
+            "cfg": 1.0, "shift": _adv("shift", 5.0), "seed": seed, "force_offload": True,
             "scheduler": "dpm++_sde", "riflex_freq_index": 0, "text_embeds": ["text", 0]}},
         "decode": {"class_type": "WanVideoDecode", "inputs": {
             "vae": ["vae", 0], "samples": ["sampler", 0], "enable_vae_tiling": False,
