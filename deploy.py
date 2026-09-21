@@ -1,29 +1,30 @@
-"""Modal deploy entry for Wan2.2-Animate (ComfyUI + Kijai fp8).
+"""Modal deploy entry for Wan-Animate-2 (DiffSynth-Studio, distilled checkpoint).
 
 Implements the `video-image-gen-video-move` node feature: given a character image
-+ a reference (driving) video, reenact the driving motion onto the character.
++ a driving video, reenact the driving motion onto the character.
 
-Runs headless ComfyUI + ComfyUI-WanVideoWrapper with Kijai's fp8 Wan2.2-Animate-14B
-plus the lightx2v 6-step distill LoRA — ~10-30x faster and ~22GB VRAM vs the official
-bf16 generate.py path (which timed out). The ComfyUI server boots once per container
-(@modal.enter) and is reused; models stay resident in VRAM across calls.
+Wan-Animate-2 is end-to-end — it consumes the driving video directly, so there is
+no pose/face extractor stage any more (v1 needed DWPose + a ComfyUI graph). We run
+`Wan-AI/Wan2.2-Animate-2-14B`'s distillation checkpoint through DiffSynth-Studio's
+`WanVideoPipeline`: 10 steps, no CFG, single GPU. Upstream's own repo only ships an
+8-GPU FSDP pipeline and the diffusers integration is still an unmerged PR, so
+DiffSynth is the one maintained single-GPU path.
 
-Deploy:        modal deploy deploy.py
-Download models: modal run comfy_app.py::download_models   (one-time, to the volume)
+Wan-Animate-2 has no character-replacement mode, so unlike v1 this plugin no longer
+serves `video-image-gen-video-mix` — tongflow-modal-scail2 covers that slot.
+
+Deploy:          modal deploy deploy.py
+Download models: modal run download.py::download   (one-time, to the volume)
 """
 
 from __future__ import annotations
-from pathlib import Path
 
 import os
-from typing import Any, Optional
+from pathlib import Path
+from typing import Optional
 
 import modal
 from tongflow import deploy
-from tongflow.models.video_image_gen_video_mix import (
-    VideoImageGenVideoMixInput,
-    VideoImageGenVideoMixOutput,
-)
 from tongflow.models.video_image_gen_video_move import (
     VideoImageGenVideoMoveInput,
     VideoImageGenVideoMoveOutput,
@@ -52,86 +53,81 @@ def _adv(name: str, default):
 # control is absent there and falls back to the plugin default.
 TONGFLOW_SLOT_PARAMS = {
     "video-image-gen-video-move": {
-        "steps": {"type": "integer", "default": 6, "min": 2, "max": 12, "label": "Steps"},
-        "shift": {"type": "number", "default": 5.0, "min": 1.0, "max": 10.0, "step": 0.5, "label": "Shift"},
-        "relight_strength": {"type": "number", "default": 1.0, "min": 0.0, "max": 1.0, "step": 0.1, "label": "Relight LoRA strength", "description": "0 keeps the character's original lighting."},
-    },
-    "video-image-gen-video-mix": {
-        "steps": {"type": "integer", "default": 6, "min": 2, "max": 12, "label": "Steps"},
-        "shift": {"type": "number", "default": 5.0, "min": 1.0, "max": 10.0, "step": 0.5, "label": "Shift"},
-        "relight_strength": {"type": "number", "default": 1.0, "min": 0.0, "max": 1.0, "step": 0.1, "label": "Relight LoRA strength", "description": "0 keeps the character's original lighting."},
+        "steps": {"type": "integer", "default": 10, "min": 4, "max": 40, "label": "Steps"},
+        "cfg_scale": {"type": "number", "default": 1.0, "min": 1.0, "max": 6.0, "step": 0.5, "label": "CFG scale", "description": "The distilled checkpoint is trained for 1.0; raising it also needs more steps."},
+        "sigma_shift": {"type": "number", "default": 5.0, "min": 1.0, "max": 10.0, "step": 0.5, "label": "Shift"},
+        "fps": {"type": "integer", "default": 24, "min": 8, "max": 30, "label": "Output FPS"},
     },
 }
 
 # Slots this plugin is the default implementation of: the node picker lists
 # it first and a newly added node preselects it. Read statically by the
 # scanner (never executed), so any SDK version imports this file fine.
-TONGFLOW_DEFAULT_SLOTS = ["video-image-gen-video-move", "video-image-gen-video-mix"]
+TONGFLOW_DEFAULT_SLOTS = ["video-image-gen-video-move"]
 
-COMFY = "/opt/ComfyUI"
-COMFY_MODELS = "/models/comfyui"
+ANIMATE2_DIR = "/models/Wan-AI/Wan2.2-Animate-2-14B"
+DIT = f"{ANIMATE2_DIR}/wan_animate_2/wan_animate_2_bf16_distillation.safetensors"
+T5 = f"{ANIMATE2_DIR}/videomodel/Wan-AI/models_t5_umt5-xxl-enc-bf16.pth"
+CLIP = f"{ANIMATE2_DIR}/videomodel/Wan-AI/models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth"
+TOKENIZER = f"{ANIMATE2_DIR}/videomodel/Wan-AI/umt5-xxl"
+VAE = "/models/Wan-AI/Wan2.1-T2V-14B/Wan2.1_VAE.pth"
 
-volume = modal.Volume.from_name("models", create_if_missing=True)
-
-# Model filenames (flat, as downloaded by comfy_app.py::download_models).
-DIT = "Wan2_2-Animate-14B_fp8_e4m3fn_scaled_KJ.safetensors"
-VAE = "Wan2_1_VAE_bf16.safetensors"
-T5 = "umt5-xxl-enc-bf16.safetensors"
-CLIPV = "clip_vision_h.safetensors"
-LORA_RELIGHT = "WanAnimate_relight_lora_fp16.safetensors"
-LORA_LIGHTX2V = "lightx2v_I2V_14B_480p_cfg_step_distill_rank64_bf16.safetensors"
-SAM3 = "sam3-fp16.safetensors"  # person segmentation for replace mode
-
-DEFAULT_PROMPT = "high quality video, natural motion, consistent character"
+# Distillation checkpoint constants — upstream-prescribed, not ABI knobs.
+LOG_SCALE = -1.3
+# Fixed context prompt for the driving video (upstream's own default).
+PROMPT_REF = "视频中的人在做动作，背景静止"
+# Upstream asks for a caption of the character's appearance + the background.
+DEFAULT_PROMPT = "人物外观描述：画面中的人物保持参考图中的外观。 背景描述：背景保持参考图中的场景。"
 NEG = ("色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，"
        "最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，"
        "画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，"
        "杂乱的背景，三条腿，背景人很多，倒着走")
 
-# Custom node packs the WanAnimate graph needs.
-CUSTOM_NODES = {
-    "ComfyUI-WanVideoWrapper": "https://github.com/kijai/ComfyUI-WanVideoWrapper.git",
-    "ComfyUI-KJNodes": "https://github.com/kijai/ComfyUI-KJNodes.git",
-    "ComfyUI-VideoHelperSuite": "https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git",
-    "comfyui_controlnet_aux": "https://github.com/Fannovel16/comfyui_controlnet_aux.git",
-    "ComfyUI-segment-anything-2": "https://github.com/kijai/ComfyUI-segment-anything-2.git",
-    # SAM3: text-promptable person segmentation + tracking for replace mode.
-    "ComfyUI-Easy-Sam3": "https://github.com/yolain/ComfyUI-Easy-Sam3.git",
-}
-_clone_cmds = []
-for _name, _url in CUSTOM_NODES.items():
-    _dst = f"{COMFY}/custom_nodes/{_name}"
-    _clone_cmds.append(f"git clone --depth 1 {_url} {_dst}")
-    _clone_cmds.append(
-        f"[ -f {_dst}/requirements.txt ] && pip install -r {_dst}/requirements.txt || true"
-    )
+# Denoising happens per clip; longer driving videos are chained clip by clip with
+# FIRST_NUM frames of overlap so identity and motion carry across the seam.
+CLIP_LEN = 81  # must stay 4n+1 for the Wan VAE's temporal stride
+FIRST_NUM = 1
+# Output resolution follows the character image; cap the pixel budget so a large
+# input can't blow up attention cost. 720x1280 is upstream's 720P setting.
+MAX_AREA = 720 * 1280
+# Hard cap on how much driving video we consume when the node leaves duration unset.
+MAX_SECONDS = 30.0
 
-app = modal.App(Path(__file__).resolve().parent.name)
+volume = modal.Volume.from_name("models", create_if_missing=True)
+
+APP_NAME = Path(__file__).resolve().parent.name
+app = modal.App(APP_NAME)
 
 image = (
     modal.Image.from_registry(
         "nvidia/cuda:12.8.1-devel-ubuntu22.04", add_python="3.12"
     )
-    .apt_install("git", "ffmpeg", "build-essential")
+    .apt_install("ffmpeg")
     .pip_install(
-        "torch==2.7.1", "torchvision==0.22.1", "torchaudio==2.7.1",
+        "torch==2.7.1", "torchvision==0.22.1",
         extra_index_url="https://download.pytorch.org/whl/cu128",
     )
-    .run_commands(
-        "git clone --depth 1 https://github.com/comfyanonymous/ComfyUI.git " + COMFY,
-        f"pip install -r {COMFY}/requirements.txt",
-        *_clone_cmds,
+    .pip_install(
+        "tongflow==0.3.3",
+        "fastapi[standard]",
+        "diffsynth==2.1.8",
+        "transformers==4.57.6",
+        "imageio[ffmpeg]==2.37.2",
+        "pillow==12.1.1",
     )
-    .pip_install("tongflow==0.3.3", "fastapi[standard]")
-    .env({"PYTHONPATH": COMFY, "HF_HOME": "/models/hf"})
+    # DiffSynth pulls weights from ModelScope unless told otherwise; ours are
+    # already on the volume and every ModelConfig is built with an explicit
+    # `path=`, so nothing should ever reach the network at boot.
+    .env({"HF_HOME": "/models/hf", "DIFFSYNTH_SKIP_DOWNLOAD": "True"})
 )
 
 with image.imports():
-    import json
-    import subprocess
-    import time
-    import urllib.error
-    import urllib.request
+    import imageio.v2 as imageio
+    import torch
+    from diffsynth.core.loader.config import ModelConfig
+    from diffsynth.pipelines.wan_video import WanVideoPipeline
+    from diffsynth.utils.data import save_video
+    from PIL import Image
 
 
 def _maybe_bytes(val: object) -> Optional[bytes]:
@@ -143,233 +139,147 @@ def _maybe_bytes(val: object) -> Optional[bytes]:
         return None
 
 
-_FPS = 16
+def _align16(v: float) -> int:
+    """Wan's VAE downsamples 8x and the DiT patchifies 2x -> multiples of 16."""
+    return max(16, int(round(v / 16.0)) * 16)
 
 
-def _probe(img_path: str, vid_path: str, duration: object) -> tuple[int, int, int]:
-    """Derive output (width, height, frame_cap) from the inputs.
+def _target_size(img_path: str, width: Optional[int], height: Optional[int]) -> tuple[int, int]:
+    """Output (width, height): the node's fields when set, else the character
+    image's own size, aligned to 16 and scaled down to the pixel budget."""
+    w = width or 0
+    h = height or 0
+    if w <= 0 or h <= 0:
+        with Image.open(img_path) as im:
+            w, h = im.size
+    area = float(w * h)
+    if area > MAX_AREA:
+        scale = (MAX_AREA / area) ** 0.5
+        w, h = w * scale, h * scale
+    return _align16(w), _align16(h)
 
-    - width/height: the character image's NATIVE resolution (no scaling), only
-      aligned to multiples of 16 (Wan VAE x8 * patch x2). Aspect ratio comes from
-      the image, never from a node field.
-    - frame_cap: VHS_LoadVideo `frame_load_cap` = duration (seconds) * 16 fps. This
-      ONLY caps how many frames load; the actual num_frames fed to the model comes
-      from VHS's own frame_count output (see _build_workflow), so num_frames always
-      equals the real pose frames and the tail can never reflect-pad into reverse.
+
+def _letterbox(frame, width: int, height: int):
+    """Fit into width x height preserving aspect, padding with black.
+
+    The pipeline itself only does a plain `.resize()`, which would stretch a
+    driving video whose aspect differs from the character image.
     """
-    import cv2
-
-    im = cv2.imread(img_path)
-    h, w = (im.shape[0], im.shape[1]) if im is not None else (832, 480)
-    W = max(16, int(round(w / 16.0)) * 16)
-    H = max(16, int(round(h / 16.0)) * 16)
-
-    try:
-        secs = float(duration) if duration is not None else 0.0
-    except (TypeError, ValueError):
-        secs = 0.0
-    frame_cap = int(round(secs * _FPS)) if secs > 0 else 161
-    frame_cap = max(13, min(frame_cap, 401))
-    return W, H, frame_cap
+    w, h = frame.size
+    if (w, h) == (width, height):
+        return frame
+    scale = min(width / w, height / h)
+    nw, nh = max(1, round(w * scale)), max(1, round(h * scale))
+    canvas = Image.new("RGB", (width, height), (0, 0, 0))
+    canvas.paste(frame.resize((nw, nh), Image.LANCZOS), ((width - nw) // 2, (height - nh) // 2))
+    return canvas
 
 
-def _build_workflow(img_name, vid_name, prompt, width, height, frame_cap, seed):
-    """Minimal pose-driven Wan2.2-Animate graph: fp8 DiT + relight + lightx2v 6-step.
+def _driving_frames(path: str, fps: int, seconds: float, width: int, height: int) -> list:
+    """Decode the driving video, resampled to `fps` and letterboxed to the output size.
 
-    num_frames is wired from VHS_LoadVideo's frame_count output (out 1) — exactly
-    what the official workflow does — so it always matches the real pose frames.
+    Decoding is sequential (one pass) because random access through imageio's
+    ffmpeg reader is slow; frames are emitted whenever the output clock catches up,
+    which both drops frames (source faster than fps) and repeats them (slower).
     """
-    return {
-        "load_img": {"class_type": "LoadImage", "inputs": {"image": img_name}},
-        "load_vid": {"class_type": "VHS_LoadVideo", "inputs": {
-            "video": vid_name, "force_rate": 16, "custom_width": 0, "custom_height": 0,
-            "frame_load_cap": frame_cap, "skip_first_frames": 0, "select_every_nth": 1}},
-        "dwpose": {"class_type": "DWPreprocessor", "inputs": {
-            "image": ["load_vid", 0], "detect_hand": "enable", "detect_body": "enable",
-            "detect_face": "enable", "resolution": 832,
-            "bbox_detector": "yolox_l.torchscript.pt",
-            "pose_estimator": "dw-ll_ucoco_384_bs5.torchscript.pt",
-            "scale_stick_for_xinsr_cn": "disable"}},
-        "clip_loader": {"class_type": "CLIPVisionLoader", "inputs": {"clip_name": CLIPV}},
-        "clip_enc": {"class_type": "WanVideoClipVisionEncode", "inputs": {
-            "clip_vision": ["clip_loader", 0], "image_1": ["load_img", 0],
-            "strength_1": 1.0, "strength_2": 1.0, "crop": "center",
-            "combine_embeds": "average", "force_offload": True}},
-        "vae": {"class_type": "WanVideoVAELoader", "inputs": {
-            "model_name": VAE, "precision": "bf16"}},
-        "lora": {"class_type": "WanVideoLoraSelectMulti", "inputs": {
-            "lora_0": LORA_RELIGHT, "strength_0": _adv("relight_strength", 1.0),
-            "lora_1": LORA_LIGHTX2V, "strength_1": 1.0,
-            "lora_2": "none", "strength_2": 1.0, "lora_3": "none", "strength_3": 1.0,
-            "lora_4": "none", "strength_4": 1.0, "merge_loras": False}},
-        "model": {"class_type": "WanVideoModelLoader", "inputs": {
-            "model": DIT, "base_precision": "fp16_fast",
-            "quantization": "fp8_e4m3fn_scaled", "load_device": "offload_device",
-            "attention_mode": "sdpa", "lora": ["lora", 0]}},
-        "text": {"class_type": "WanVideoTextEncodeCached", "inputs": {
-            "model_name": T5, "precision": "bf16", "positive_prompt": prompt,
-            "negative_prompt": NEG, "quantization": "disabled",
-            "use_disk_cache": False, "device": "gpu"}},
-        "embeds": {"class_type": "WanVideoAnimateEmbeds", "inputs": {
-            "vae": ["vae", 0], "width": width, "height": height,
-            "num_frames": ["load_vid", 1], "force_offload": True,
-            "frame_window_size": 77, "colormatch": "disabled",
-            "pose_strength": 1.0, "face_strength": 1.0,
-            "clip_embeds": ["clip_enc", 0], "ref_images": ["load_img", 0],
-            "pose_images": ["dwpose", 0]}},
-        "sampler": {"class_type": "WanVideoSampler", "inputs": {
-            "model": ["model", 0], "image_embeds": ["embeds", 0], "steps": _adv("steps", 6),
-            "cfg": 1.0, "shift": _adv("shift", 5.0), "seed": seed, "force_offload": True,
-            "scheduler": "dpm++_sde", "riflex_freq_index": 0, "text_embeds": ["text", 0]}},
-        "decode": {"class_type": "WanVideoDecode", "inputs": {
-            "vae": ["vae", 0], "samples": ["sampler", 0], "enable_vae_tiling": False,
-            "tile_x": 272, "tile_y": 272, "tile_stride_x": 144, "tile_stride_y": 128}},
-        # WanAnim looping rounds up to whole frame_window_size windows and reflect-pads
-        # the pose tail (reversed tail). Trim back to the real loaded frame count.
-        "trim": {"class_type": "GetImageRangeFromBatch", "inputs": {
-            "images": ["decode", 0], "start_index": 0, "num_frames": ["load_vid", 1]}},
-        "save": {"class_type": "VHS_VideoCombine", "inputs": {
-            "images": ["trim", 0], "frame_rate": 16, "loop_count": 0,
-            "filename_prefix": "wananim", "format": "video/h264-mp4",
-            "pingpong": False, "save_output": True}},
-    }
-
-
-def _probe_video(vid_path: str) -> tuple[int, int, int]:
-    """Replace mode: output resolution = driving video's (aligned 16). frame_cap=0
-    means VHS loads the WHOLE video so the result matches the reference length —
-    WanAnim looping keeps VRAM bounded per window regardless of total length."""
-    import cv2
-
-    cap = cv2.VideoCapture(vid_path)
-    vw = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 832)
-    vh = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 480)
-    cap.release()
-    W = max(16, int(round(vw / 16.0)) * 16)
-    H = max(16, int(round(vh / 16.0)) * 16)
-    return W, H, 0
-
-
-def _build_replace_workflow(img_name, vid_name, prompt, width, height, frame_cap, seed):
-    """Replace mode: SAM3 auto-segments the person in the driving video; the masked
-    region is inpainted with the character (pose-driven), keeping the original scene."""
-    wf = _build_workflow(img_name, vid_name, prompt, width, height, frame_cap, seed)
-    wf["load_vid"]["inputs"]["custom_width"] = width
-    wf["load_vid"]["inputs"]["custom_height"] = height
-    wf["sam3_model"] = {"class_type": "easy sam3ModelLoader", "inputs": {
-        "model": SAM3, "segmentor": "video", "device": "cuda", "precision": "fp16"}}
-    wf["sam3_seg"] = {"class_type": "easy sam3VideoSegmentation", "inputs": {
-        "sam3_model": ["sam3_model", 0], "video_frames": ["load_vid", 0],
-        "prompt": "person", "frame_index": 0, "object_id": 1,
-        "score_threshold_detection": 0.5, "new_det_thresh": 0.7,
-        "propagation_direction": "both", "start_frame_index": 0,
-        "max_frames_to_track": -1, "close_after_propagation": True,
-        "keep_model_loaded": False}}
-    # Official mask pipeline: SAM -> GrowMask -> BlockifyMask. Blockify coarsens the
-    # tight silhouette into blocks so a differently-shaped character isn't clipped to
-    # the original person's outline (which produced black edges).
-    wf["grow"] = {"class_type": "GrowMask", "inputs": {
-        "mask": ["sam3_seg", 0], "expand": 10, "tapered_corners": True}}
-    wf["blockify"] = {"class_type": "BlockifyMask", "inputs": {
-        "masks": ["grow", 0], "block_size": 32, "device": "gpu"}}
-    # Black out the masked region in bg so the original person doesn't leak through
-    # bg conditioning — otherwise the reference character never replaces them.
-    wf["bg_masked"] = {"class_type": "DrawMaskOnImage", "inputs": {
-        "image": ["load_vid", 0], "mask": ["blockify", 0], "color": "0, 0, 0",
-        "device": "gpu"}}
-    wf["embeds"]["inputs"]["bg_images"] = ["bg_masked", 0]
-    wf["embeds"]["inputs"]["mask"] = ["blockify", 0]
-    wf["save"]["inputs"]["filename_prefix"] = "wanrepl"
-    return wf
-
-
-def _submit_graph(base, wf):
-    """Submit a ComfyUI workflow, poll, return (True, mp4_bytes) or (False, error)."""
-    body = json.dumps({"prompt": wf}).encode()
-    req = urllib.request.Request(f"{base}/prompt", data=body,
-                                 headers={"Content-Type": "application/json"})
+    limit = seconds if seconds > 0 else MAX_SECONDS
+    max_frames = max(1, int(round(min(limit, MAX_SECONDS) * fps)))
+    reader = imageio.get_reader(path)
     try:
-        pid = json.loads(urllib.request.urlopen(req, timeout=30).read())["prompt_id"]
-    except urllib.error.HTTPError as e:
-        return False, f"workflow rejected: {e.read().decode()[:1000]}"
-    out = None
-    for _ in range(1800):
-        time.sleep(1)
-        with urllib.request.urlopen(f"{base}/history/{pid}", timeout=10) as r:
-            hist = json.loads(r.read())
-        if pid in hist:
-            h = hist[pid]
-            if h.get("outputs"):
-                out = h["outputs"]
+        src_fps = float(reader.get_meta_data().get("fps") or fps)
+    except Exception:
+        src_fps = float(fps)
+    if src_fps <= 0:
+        src_fps = float(fps)
+
+    frames: list = []
+    next_t, step = 0.0, 1.0 / fps
+    try:
+        for i, raw in enumerate(reader):
+            t = i / src_fps
+            pil = None
+            while next_t <= t + 1e-9 and len(frames) < max_frames:
+                if pil is None:
+                    pil = _letterbox(Image.fromarray(raw).convert("RGB"), width, height)
+                frames.append(pil)
+                next_t += step
+            if len(frames) >= max_frames:
                 break
-            if h.get("status", {}).get("status_str") == "error":
-                return False, "comfy error: " + json.dumps(h.get("status"))[:1200]
-    if not out:
-        return False, "timed out"
-    for node_out in out.values():
-        for key in ("gifs", "videos", "images"):
-            for item in node_out.get(key, []):
-                fn, sub = item.get("filename"), item.get("subfolder", "")
-                typ = item.get("type", "output")
-                d = {"output": "output", "temp": "temp"}.get(typ, "output")
-                path = os.path.join(COMFY, d, sub, fn or "")
-                if fn and fn.endswith((".mp4", ".webm")) and os.path.isfile(path):
-                    with open(path, "rb") as fh:
-                        raw = fh.read()
-                    if raw:
-                        return True, raw
-    return False, "no video output"
+    finally:
+        reader.close()
+    return frames
+
+
+def _zigzag_padding(frames: list, target_len: int) -> list:
+    """Extend to target_len by bouncing back and forth, as upstream's demo does."""
+    if len(frames) == 1:
+        return [frames[0]] * target_len
+    idx, flip, out = 0, False, []
+    while len(out) < target_len:
+        out.append(frames[idx])
+        idx += -1 if flip else 1
+        if idx == 0 or idx == len(frames) - 1:
+            flip = not flip
+    return out[:target_len]
+
+
+def _generate(pipe, reference_image, driving: list, clip_len: int, first_num: int, **kwargs) -> list:
+    """Run the driving video clip by clip, carrying `first_num` frames over each seam."""
+    real_len = len(driving)
+    if real_len == 0:
+        return []
+    step = clip_len - first_num
+    num_clips = 1 if real_len <= clip_len else (real_len - clip_len + step - 1) // step + 1
+    target_len = clip_len + (num_clips - 1) * step
+    if real_len < target_len:
+        driving = _zigzag_padding(driving, target_len)
+
+    out: list = []
+    prev_tail = None
+    for i in range(num_clips):
+        start = i * step
+        seg = pipe(
+            animate2_reference_image=reference_image,
+            animate2_reference_video=driving[start:start + clip_len],
+            animate2_refert_images=None if i == 0 else prev_tail,
+            num_frames=clip_len,
+            **kwargs,
+        )
+        prev_tail = seg[-first_num:]
+        if i != 0:
+            seg = seg[first_num:]
+        out.extend(seg)
+    return out[:real_len]
 
 
 @deploy
 @app.cls(image=image, gpu="A100-80GB", volumes={"/models": volume},
-         timeout=1800, scaledown_window=2)
+         timeout=3600, scaledown_window=2)
 class Inference:
     @modal.enter()
     def _boot(self) -> None:
-        """Boot the ComfyUI server once; reused across calls (models stay warm)."""
-        os.makedirs(COMFY_MODELS, exist_ok=True)
-        with open(os.path.join(COMFY, "extra_model_paths.yaml"), "w") as f:
-            f.write(
-                "wan_volume:\n"
-                f"  base_path: {COMFY_MODELS}/\n"
-                "  diffusion_models: diffusion_models\n  vae: vae\n"
-                "  text_encoders: text_encoders\n  clip_vision: clip_vision\n"
-                "  loras: loras\n"
-            )
-        # sam3 is a custom model-folder type — symlink it so LoadSam3Model finds it.
-        os.makedirs(f"{COMFY_MODELS}/sam3", exist_ok=True)
-        link = f"{COMFY}/models/sam3"
-        if not os.path.islink(link) and not os.path.isdir(link):
-            os.makedirs(f"{COMFY}/models", exist_ok=True)
-            try:
-                os.symlink(f"{COMFY_MODELS}/sam3", link)
-            except FileExistsError:
-                pass
-        self.proc = subprocess.Popen(
-            ["python", "main.py", "--listen", "127.0.0.1", "--port", "8188",
-             "--disable-auto-launch"],
-            cwd=COMFY,
+        """Load the pipeline once; the container is reused and stays warm."""
+        vram = {
+            "offload_dtype": torch.bfloat16,
+            "offload_device": "cpu",
+            "onload_dtype": torch.bfloat16,
+            "onload_device": "cuda",
+            "preparing_dtype": torch.bfloat16,
+            "preparing_device": "cuda",
+            "computation_dtype": torch.bfloat16,
+            "computation_device": "cuda",
+        }
+        self.pipe = WanVideoPipeline.from_pretrained(
+            torch_dtype=torch.bfloat16,
+            device="cuda",
+            model_configs=[
+                ModelConfig(path=DIT, **vram),
+                ModelConfig(path=T5, **vram),
+                ModelConfig(path=CLIP, **vram),
+                ModelConfig(path=VAE, **vram),
+            ],
+            tokenizer_config=ModelConfig(path=TOKENIZER),
         )
-        self.base = "http://127.0.0.1:8188"
-        for _ in range(300):
-            if self.proc.poll() is not None:
-                raise RuntimeError(f"ComfyUI exited early: {self.proc.returncode}")
-            try:
-                with urllib.request.urlopen(f"{self.base}/object_info", timeout=2) as r:
-                    if r.status == 200:
-                        json.loads(r.read())
-                        return
-            except Exception:
-                time.sleep(1)
-        raise RuntimeError("ComfyUI server did not become ready")
-
-    @modal.exit()
-    def _shutdown(self) -> None:
-        try:
-            self.proc.terminate()
-        except Exception:
-            pass
 
     @modal.method()
     @node_slot(NodeSlots.VIDEO_IMAGE_GEN_VIDEO_MOVE)
@@ -379,71 +289,68 @@ class Inference:
         img_b = _maybe_bytes(input.image)
         if not img_b:
             return VideoImageGenVideoMoveOutput(success=False, error="Missing image")
-        ref_b = _maybe_bytes(input.video)
-        if not ref_b:
+        drive_b = _maybe_bytes(input.video)
+        if not drive_b:
             return VideoImageGenVideoMoveOutput(
                 success=False, error="Missing reference (driving) video")
 
-        prompt = (input.text or "").strip() or DEFAULT_PROMPT
-        seed = int(input.seed) if input.seed is not None else 42
-
-        os.makedirs(f"{COMFY}/input", exist_ok=True)
-        ref_path = f"{COMFY}/input/ref.png"
-        drive_path = f"{COMFY}/input/drive.mp4"
+        work = "/tmp/wananimate2"
+        os.makedirs(work, exist_ok=True)
+        ref_path = f"{work}/ref.png"
+        drive_path = f"{work}/drive.mp4"
+        out_path = f"{work}/out.mp4"
         with open(ref_path, "wb") as f:
             f.write(img_b)
         with open(drive_path, "wb") as f:
-            f.write(ref_b)
+            f.write(drive_b)
 
-        # Resolution follows the character image; duration only caps how many frames
-        # VHS loads (frame_cap). num_frames is taken from VHS's real frame_count
-        # inside the graph, so the motion never reflect-pads into reverse.
-        width, height, frame_cap = _probe(ref_path, drive_path, input.duration)
+        fps = int(_adv("fps", 24))
+        width, height = _target_size(ref_path, input.width, input.height)
+        seconds = float(input.duration) if input.duration is not None else 0.0
 
-        wf = _build_workflow("ref.png", "drive.mp4", prompt, width, height,
-                             frame_cap, seed)
-        ok, res = _submit_graph(self.base, wf)
-        if ok:
+        driving = _driving_frames(drive_path, fps, seconds, width, height)
+        if not driving:
             return VideoImageGenVideoMoveOutput(
-                success=True, video=asset(res, mime="video/mp4"))
-        return VideoImageGenVideoMoveOutput(success=False, error=str(res))
+                success=False, error="Driving video has no decodable frames")
 
-    @modal.method()
-    @node_slot(NodeSlots.VIDEO_IMAGE_GEN_VIDEO_MIX)
-    def video_image_gen_video_mix(
-        self, input: VideoImageGenVideoMixInput
-    ) -> VideoImageGenVideoMixOutput:
-        """Replace mode: swap the person in the driving video with the character,
-        keeping the original scene (SAM3 auto-segments the person)."""
-        img_b = _maybe_bytes(input.image)
-        if not img_b:
-            return VideoImageGenVideoMixOutput(success=False, error="Missing image")
-        ref_b = _maybe_bytes(input.video)
-        if not ref_b:
-            return VideoImageGenVideoMixOutput(
-                success=False, error="Missing reference (driving) video")
+        with Image.open(ref_path) as im:
+            reference = _letterbox(im.convert("RGB"), width, height)
 
-        prompt = (input.text or "").strip() or DEFAULT_PROMPT
+        frames = _generate(
+            self.pipe,
+            reference_image=reference,
+            driving=driving,
+            clip_len=CLIP_LEN,
+            first_num=FIRST_NUM,
+            prompt=(input.text or "").strip() or DEFAULT_PROMPT,
+            negative_prompt=NEG,
+            animate2_prompt_ref=PROMPT_REF,
+            animate2_offload_kv=True,
+            animate2_log_scale=LOG_SCALE,
+            height=height,
+            width=width,
+            num_inference_steps=_adv("steps", 10),
+            cfg_scale=_adv("cfg_scale", 1.0),
+            sigma_shift=_adv("sigma_shift", 5.0),
+            seed=int(input.seed) if input.seed is not None else 42,
+            tiled=True,
+        )
+        if not frames:
+            return VideoImageGenVideoMoveOutput(success=False, error="No frames generated")
 
-        os.makedirs(f"{COMFY}/input", exist_ok=True)
-        ref_path = f"{COMFY}/input/ref.png"
-        drive_path = f"{COMFY}/input/drive.mp4"
-        with open(ref_path, "wb") as f:
-            f.write(img_b)
-        with open(drive_path, "wb") as f:
-            f.write(ref_b)
+        save_video(frames, out_path, fps=fps, quality=5)
+        with open(out_path, "rb") as f:
+            raw = f.read()
+        if not raw:
+            return VideoImageGenVideoMoveOutput(success=False, error="Empty video output")
+        return VideoImageGenVideoMoveOutput(success=True, video=asset(raw, mime="video/mp4"))
 
-        # Replace output keeps the driving video's resolution.
-        width, height, frame_cap = _probe_video(drive_path)
-        wf = _build_replace_workflow("ref.png", "drive.mp4", prompt, width, height,
-                                     frame_cap, 42)
-        ok, res = _submit_graph(self.base, wf)
-        if ok:
-            return VideoImageGenVideoMixOutput(
-                success=True, video=asset(res, mime="video/mp4"))
-        return VideoImageGenVideoMixOutput(success=False, error=str(res))
-
-    @modal.fastapi_endpoint(method="GET", label=f"{Path(__file__).resolve().parent.name}-serve")
+    # Cloud single-node self-serve: ONE container, direct browser stream. The
+    # browser's EventSource is 302'd here with taskId/token/origin; serve_stream
+    # _from_spec (SDK) fetches the run spec from the Worker, runs the slot
+    # in-container, and streams progress + result. Streaming dodges the 150s
+    # cap. Label is uniform (`<app>-serve`) so the Worker derives the URL.
+    @modal.fastapi_endpoint(method="GET", label=f"{APP_NAME}-serve")
     def serve(self, taskId: str = "", token: str = "", origin: str = ""):
         from fastapi.responses import StreamingResponse
         from tongflow import serve_stream_from_spec
@@ -456,4 +363,3 @@ class Inference:
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "Access-Control-Allow-Origin": "*"},
         )
-

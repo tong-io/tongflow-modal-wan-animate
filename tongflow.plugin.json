@@ -1,7 +1,7 @@
 {
     "plugin": {
-        "name": "Wan-Animate",
-        "description": "Character swap and motion transfer with Wan2.2-Animate-14B (Animate Mix / Animate Move).",
+        "name": "Wan-Animate-2",
+        "description": "End-to-end character animation with Wan2.2-Animate-2-14B: character image + driving video, no pose extraction stage.",
         "icon": "/plugins/tongflow-modal-wan-animate.svg"
     },
     "env": [
@@ -18,13 +18,13 @@
         },
         {
             "key": "HF_TOKEN",
-            "description": "Required to fetch Wan-AI/Wan2.2-Animate-14B",
+            "description": "Optional — Wan2.2-Animate-2-14B is public; a token only helps with Hugging Face rate limits",
             "url": "https://huggingface.co/settings/tokens",
-            "required": true
+            "required": false
         },
         {
             "key": "TONGFLOW_MODAL_CALL_TIMEOUT_S",
-            "default": "2400",
+            "default": "3600",
             "description": "Max seconds to wait for a Modal call"
         }
     ]

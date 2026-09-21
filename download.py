@@ -1,32 +1,42 @@
-"""Modal download entry for Wan2.2-Animate.
+"""Modal download entry for Wan-Animate-2.
 
 Run:
   modal run download.py::download
 
-Downloads the Wan2.2-Animate-14B weights (main DiT/VAE/T5 + the preprocessing
-``process_checkpoint`` with pose2d/det checkpoints) to the shared ``models``
-volume. The large FLUX.1-Kontext image-editing model is skipped — it is only
-needed for the ``--use_flux`` retarget variant, which this plugin does not use.
+Fetches, into the shared ``models`` volume, exactly what deploy.py loads:
+the Animate-2 distillation DiT plus the UMT5 text encoder, CLIP vision encoder
+and UMT5 tokenizer that ship alongside it, and the Wan2.1 VAE (which lives in
+the Wan2.1-T2V-14B repo, matching DiffSynth-Studio's own Animate-2 example).
+
+The base (non-distilled) checkpoint and the FLUX retarget model are skipped —
+the plugin runs the 10-step distillation path only.
+
+Both repos are public and Apache 2.0; ``HF_TOKEN`` is optional and only helps
+with Hugging Face rate limits.
 """
 
 from __future__ import annotations
 
 import os
-from typing import Any
 
 import modal
 
-_cfg: dict[str, Any] = {}
+ANIMATE2_REPO = "Wan-AI/Wan2.2-Animate-2-14B"
+VAE_REPO = "Wan-AI/Wan2.1-T2V-14B"
 
-WAN_REPO_ID = "Wan-AI/Wan2.2-Animate-14B"
-WAN_DIR = f"/models/{WAN_REPO_ID}"
+ANIMATE2_DIR = f"/models/{ANIMATE2_REPO}"
+VAE_DIR = f"/models/{VAE_REPO}"
 
-# FLUX image-editing model (~20GB+) is only used by `--use_flux` retargeting,
-# which we don't enable; skip it to keep the download lean.
-IGNORE_PATTERNS = ["process_checkpoint/FLUX.1-Kontext-dev/*"]
+# Everything deploy.py opens by path, and nothing else.
+ANIMATE2_PATTERNS = [
+    "wan_animate_2/wan_animate_2_bf16_distillation.safetensors",
+    "videomodel/Wan-AI/models_t5_umt5-xxl-enc-bf16.pth",
+    "videomodel/Wan-AI/models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth",
+    "videomodel/Wan-AI/umt5-xxl/*",
+]
+VAE_PATTERNS = ["Wan2.1_VAE.pth"]
 
-volume_name = str(_cfg.get("volumeName") or "models")
-volume = modal.Volume.from_name(volume_name, create_if_missing=True)
+volume = modal.Volume.from_name("models", create_if_missing=True)
 model_downloader = modal.App("model_downloader")
 
 
@@ -41,21 +51,24 @@ model_downloader = modal.App("model_downloader")
 def _download() -> None:
     from huggingface_hub import snapshot_download
 
-    # Wan2.2-Animate-14B is a public repo; token is optional but harmless.
     token = os.environ.get("HF_TOKEN") or None
-    # Always run snapshot_download — it is resumable and only fetches files that
-    # are missing or changed, so it completes a previous partial download (the
-    # earlier marker check wrongly skipped this when only config.json existed).
-    os.makedirs(WAN_DIR, exist_ok=True)
-    print(f"Downloading {WAN_REPO_ID} (excluding FLUX) ...")
-    snapshot_download(
-        repo_id=WAN_REPO_ID,
-        local_dir=WAN_DIR,
-        local_dir_use_symlinks=False,
-        ignore_patterns=IGNORE_PATTERNS,
-        token=token,
-    )
-    print(f"Done: {WAN_DIR}")
+    # snapshot_download is resumable and only fetches what is missing or changed,
+    # so it also completes an earlier partial download — never skip it on a
+    # directory that merely exists.
+    for repo_id, local_dir, patterns in (
+        (ANIMATE2_REPO, ANIMATE2_DIR, ANIMATE2_PATTERNS),
+        (VAE_REPO, VAE_DIR, VAE_PATTERNS),
+    ):
+        os.makedirs(local_dir, exist_ok=True)
+        print(f"Downloading {repo_id} ...")
+        snapshot_download(
+            repo_id=repo_id,
+            local_dir=local_dir,
+            local_dir_use_symlinks=False,
+            allow_patterns=patterns,
+            token=token,
+        )
+        print(f"Done: {local_dir}")
 
     volume.commit()
 
